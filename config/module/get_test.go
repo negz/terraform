@@ -39,6 +39,10 @@ var testMods = map[string]testMod{
 		location: "test-fixtures/registry-tar-subdir/foo.tgz//*?archive=tar.gz",
 		version:  "0.1.2",
 	},
+	"exists-in-registry/identifier/provider": {
+		location: "file:///registry/exists",
+		version:  "0.2.0",
+	},
 }
 
 func latestVersion(versions []string) string {
@@ -65,7 +69,7 @@ func mockRegistry() *httptest.Server {
 		http.StripPrefix("/v1/modules/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			p := strings.TrimLeft(r.URL.Path, "/")
 			// handle download request
-			download := regexp.MustCompile(`^(\w+/\w+/\w+)/download$`)
+			download := regexp.MustCompile(`^([-a-z]+/\w+/\w+)/download$`)
 
 			// download lookup
 			matches := download.FindStringSubmatch(p)
@@ -97,6 +101,26 @@ func mockRegistry() *httptest.Server {
 	return server
 }
 
+func setResetRegDetector(server *httptest.Server) func() {
+	regDetector := &registryDetector{
+		api:    server.URL + "/v1/modules",
+		client: server.Client(),
+	}
+
+	origDetectors := detectors
+	detectors = []getter.Detector{
+		new(getter.GitHubDetector),
+		new(getter.BitBucketDetector),
+		new(getter.S3Detector),
+		regDetector,
+		new(getter.FileDetector),
+	}
+
+	return func() {
+		detectors = origDetectors
+	}
+}
+
 func TestDetectRegistry(t *testing.T) {
 	server := mockRegistry()
 	defer server.Close()
@@ -122,10 +146,10 @@ func TestDetectRegistry(t *testing.T) {
 			location: testMods["registry/foo/baz"].location,
 			found:    true,
 		},
-		// this should not be found, but not stop detection
+		// this should not be found, and is no longer valid as a local source
 		{
 			source: "registry/foo/notfound",
-			found:  false,
+			err:    true,
 		},
 
 		// a full url should not be detected
@@ -154,7 +178,7 @@ func TestDetectRegistry(t *testing.T) {
 		t.Run(tc.source, func(t *testing.T) {
 			loc, ok, err := detector.Detect(tc.source, "")
 			if (err == nil) == tc.err {
-				t.Fatalf("expected error? %t; got error :%v", tc.err, err)
+				t.Fatalf("expected error? %t; got error: %v", tc.err, err)
 			}
 
 			if ok != tc.found {
@@ -174,23 +198,11 @@ func TestDetectRegistry(t *testing.T) {
 func TestDetectors(t *testing.T) {
 	server := mockRegistry()
 	defer server.Close()
+	defer setResetRegDetector(server)()
 
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
-	}
-
-	regDetector := &registryDetector{
-		api:    server.URL + "/v1/modules",
-		client: server.Client(),
-	}
-
-	detectors := []getter.Detector{
-		new(getter.GitHubDetector),
-		new(getter.BitBucketDetector),
-		new(getter.S3Detector),
-		new(localDetector),
-		regDetector,
 	}
 
 	for _, tc := range []struct {
@@ -203,7 +215,7 @@ func TestDetectors(t *testing.T) {
 			source:   "registry/foo/bar",
 			location: "file:///download/registry/foo/bar/0.2.3//*?archive=tar.gz",
 		},
-		// this should not be found, but not stop detection
+		// this should not be found, and is no longer a valid local source
 		{
 			source: "registry/foo/notfound",
 			err:    true,
@@ -225,26 +237,36 @@ func TestDetectors(t *testing.T) {
 		// local paths should be detected as such, even if they're match
 		// registry modules.
 		{
-			source: "./registry/foo/bar",
-			err:    true,
+			source:   "./registry/foo/bar",
+			location: "file://" + filepath.Join(wd, "registry/foo/bar"),
 		},
 		{
-			source: "/registry/foo/bar",
-			err:    true,
+			source:   "/registry/foo/bar",
+			location: "file:///registry/foo/bar",
 		},
 
-		// wrong number of parts can't be regisry IDs
+		// Wrong number of parts can't be registry IDs.
+		// This is returned as a local path for now, but may return an error at
+		// some point.
 		{
-			source: "something/registry/foo/notfound",
-			err:    true,
+			source:   "something/here/registry/foo/notfound",
+			location: "file://" + filepath.Join(wd, "something/here/registry/foo/notfound"),
 		},
 
-		// make sure a local module that looks like a registry id takes precedence
+		// make sure a local module that looks like a registry id can be found
 		{
 			source:  "namespace/identifier/provider",
 			fixture: "discover-subdirs",
-			// this should be found locally
-			location: "file://" + filepath.Join(wd, fixtureDir, "discover-subdirs/namespace/identifier/provider"),
+			err:     true,
+		},
+
+		// The registry takes precedence over local paths if they don't start
+		// with a relative or absolute path
+		{
+			source:  "exists-in-registry/identifier/provider",
+			fixture: "discover-registry-local",
+			// registry should take precidence
+			location: "file:///registry/exists",
 		},
 	} {
 
@@ -278,24 +300,7 @@ func TestDetectors(t *testing.T) {
 func TestRegistryGitHubArchive(t *testing.T) {
 	server := mockRegistry()
 	defer server.Close()
-
-	regDetector := &registryDetector{
-		api:    server.URL + "/v1/modules",
-		client: server.Client(),
-	}
-
-	origDetectors := detectors
-	defer func() {
-		detectors = origDetectors
-	}()
-
-	detectors = []getter.Detector{
-		new(getter.GitHubDetector),
-		new(getter.BitBucketDetector),
-		new(getter.S3Detector),
-		new(localDetector),
-		regDetector,
-	}
+	defer setResetRegDetector(server)()
 
 	storage := testStorage(t)
 	tree := NewTree("", testConfig(t, "registry-tar-subdir"))
@@ -326,6 +331,34 @@ func TestRegistryGitHubArchive(t *testing.T) {
 
 	actual := strings.TrimSpace(tree.String())
 	expected := strings.TrimSpace(treeLoadSubdirStr)
+	if actual != expected {
+		t.Fatalf("got: \n\n%s\nexpected: \n\n%s", actual, expected)
+	}
+}
+
+// Test that the //subdir notation can be used with registry modules
+func TestRegisryModuleSubdir(t *testing.T) {
+	server := mockRegistry()
+	defer server.Close()
+	defer setResetRegDetector(server)()
+
+	storage := testStorage(t)
+	tree := NewTree("", testConfig(t, "registry-subdir"))
+
+	if err := tree.Load(storage, GetModeGet); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if !tree.Loaded() {
+		t.Fatal("should be loaded")
+	}
+
+	if err := tree.Load(storage, GetModeNone); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	actual := strings.TrimSpace(tree.String())
+	expected := strings.TrimSpace(treeLoadRegistrySubdirStr)
 	if actual != expected {
 		t.Fatalf("got: \n\n%s\nexpected: \n\n%s", actual, expected)
 	}
